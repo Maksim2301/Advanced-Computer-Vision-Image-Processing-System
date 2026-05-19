@@ -1,347 +1,242 @@
-import requests
-from bs4 import BeautifulSoup
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.feature_extraction.text import TfidfVectorizer
-import nltk
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
-import re
-import time
-import urllib3
-import random
-from nltk.stem import WordNetLemmatizer
-import spacy
+import cv2
 import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import MinMaxScaler
+from skimage.metrics import structural_similarity as ssim
 
-# Вимикаємо попередження SSL
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+def task2_clustering_improved(image_path, k=10, spatial_weight=0.05, exg_weight=1.5, texture_weight=1.2):
+    print(f"--- Виконання кластеризації (k={k}) ---")
+    img = cv2.imread(image_path)
+    if img is None:
+        print(f"Помилка: не знайдено {image_path}")
+        return
 
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-def setup_nlp():
-    print("Завантаження ресурсів NLTK...")
-    nltk.download('stopwords', quiet=True)
-    nltk.download('vader_lexicon', quiet=True)
-    nltk.download('punkt', quiet=True)
+    # 1. Фільтрація
+    denoised = cv2.bilateralFilter(img_rgb, d=12, sigmaColor=40, sigmaSpace=75)
+    img_lab = cv2.cvtColor(denoised, cv2.COLOR_RGB2LAB)
 
-lemmatizer = WordNetLemmatizer()
-setup_nlp()
+    h, w, _ = img_lab.shape
 
-try:
-    nlp = spacy.load("en_core_web_sm", disable=['parser', 'ner'])
-except OSError:
-    print("Помилка: Модель spaCy не знайдена!")
-    print("Будь ласка, виконайте в терміналі: python -m spacy download en_core_web_sm")
-    exit()
+    # 2. Просторові координати
+    x_coords, y_coords = np.meshgrid(np.arange(w), np.arange(h))
 
-# --- 1. WEB-СКРАПІНГ ---
+    # 3. Розрахунок ExG (вегетаційний індекс)
+    R, G, B_chan = cv2.split(denoised.astype(np.float32))
+    exg = (2 * G - R - B_chan)
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    mu = cv2.blur(gray, (5, 5))
+    mu2 = cv2.blur(gray ** 2, (5, 5))
+    texture = np.sqrt(np.maximum(mu2 - mu ** 2, 0))
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5',
-    'Referer': 'https://www.google.com/'
-}
+    # Формуємо масив з 7 ознак: L, A, B, X, Y, ExG, Texture
+    pixel_features = np.zeros((h * w, 7), dtype=np.float32)
+    pixel_features[:, :3] = img_lab.reshape((-1, 3))
+    pixel_features[:, 3] = x_coords.flatten()
+    pixel_features[:, 4] = y_coords.flatten()
+    pixel_features[:, 5] = exg.flatten()
+    pixel_features[:, 6] = texture.flatten()
 
+    scaler = MinMaxScaler()
+    pixel_features_scaled = scaler.fit_transform(pixel_features)
+    pixel_features_scaled[:, 3] *= spatial_weight
+    pixel_features_scaled[:, 4] *= spatial_weight
+    pixel_features_scaled[:, 5] *= exg_weight
+    pixel_features_scaled[:, 6] *= texture_weight
 
-def fetch_html(url):
-    try:
-        time.sleep(random.uniform(0.5, 1.5))
-        response = requests.get(url, headers=HEADERS, timeout=15, verify=False)
-        response.raise_for_status()
-        return response.text
-    except Exception as e:
-        print(f"Помилка завантаження {url}: {e}")
-        return None
+    # Кластеризація KMeans
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(pixel_features_scaled)
 
+    # Відновлення кольорів кластерів 
+    centers_rgb = np.zeros((k, 3), dtype=np.uint8)
+    pixels_rgb_flat = img_rgb.reshape((-1, 3))
 
-def get_article_text(url, source):
-    html = fetch_html(url)
-    if not html: return ""
-    soup = BeautifulSoup(html, 'html.parser')
+    for i in range(k):
+        mask = (labels == i)
+        if np.any(mask):
+            centers_rgb[i] = np.mean(pixels_rgb_flat[mask], axis=0)
 
-    for tag in soup(['style', 'script', 'nav', 'footer', 'figcaption', 'aside', 'header', 'figure']):
-        tag.decompose()
+    segmented_image = centers_rgb[labels].reshape(img_rgb.shape)
 
-    container = None
-    if source == 'The Guardian':
-        container = soup.find('div', {'data-gu-name': 'body'}) or soup.find('article') or soup.find('main')
-    elif source == 'NPR':
-        container = soup.find('div', id='storytext') or soup.find('div', class_='storytext') or soup.find('article')
-    elif source == 'PBS':
-        container = soup.find('article') or soup.find(class_='body-text') or soup.find(class_='post-content')
+    fig, ax = plt.subplots(1, 3, figsize=(18, 6))
+    ax[0].imshow(img_rgb)
+    ax[0].set_title("Оригінал")
+    ax[1].imshow(denoised)
+    ax[1].set_title("Фільтрація (Bilateral)")
+    ax[2].imshow(segmented_image)
+    ax[2].set_title(f"Segmented (k={k})")
 
-    search_area = container if container else soup
-    paragraphs = [p.get_text(strip=True) for p in search_area.find_all('p') if len(p.get_text(strip=True)) > 50]
-
-    full_text = " ".join(paragraphs)
-    return full_text[:3500]
-
-
-def scrape_guardian(limit=50):
-    print(f"Скрапінг The Guardian (Ціль: {limit} статей)...")
-    news_list = []
-    seen_links = set()
-    page = 1
-
-    while len(news_list) < limit and page <= 10:
-        url = f'https://www.theguardian.com/world?page={page}'
-        html = fetch_html(url)
-        if not html: break
-
-        soup = BeautifulSoup(html, 'html.parser')
-
-        for a_tag in soup.find_all('a', href=True):
-            link = a_tag['href']
-
-            if '/world/' in link and '/video/' not in link and '/audio/' not in link and '/gallery/' not in link and len(link.split('/')) > 5:
-                if link.startswith('/'): link = 'https://www.theguardian.com' + link
-
-                title = a_tag.get('aria-label') or a_tag.get_text(strip=True)
-
-                if title and len(title) > 15 and link not in seen_links:
-                    seen_links.add(link)
-                    article_text = get_article_text(link, 'The Guardian')
-
-                    if len(article_text) > 300:
-                        news_list.append({
-                            'source': 'The Guardian',
-                            'title': title,
-                            'description': article_text,
-                            'link': link
-                        })
-
-            if len(news_list) >= limit: break
-        page += 1
-
-    print(f"The Guardian: Зібрано {len(news_list)}")
-    return news_list
-
-
-def scrape_npr(limit=50):
-    print(f"Скрапінг NPR (Ціль: {limit} статей)...")
-    sections = ['news/', 'world/', 'politics/', 'national/', 'business/']
-    news_list = []
-    seen_links = set()
-
-    for section in sections:
-        if len(news_list) >= limit: break
-        url = f'https://www.npr.org/sections/{section}'
-        html = fetch_html(url)
-        if not html: continue
-
-        soup = BeautifulSoup(html, 'html.parser')
-        articles = soup.find_all('article', class_='item')
-
-        for article in articles:
-            title_tag = article.find('h2', class_='title')
-            if not title_tag or not title_tag.find('a'): continue
-            title = title_tag.get_text(strip=True)
-            link = title_tag.find('a').get('href', '')
-
-            if len(title) > 20 and link and link not in seen_links:
-                seen_links.add(link)
-                article_text = get_article_text(link, 'NPR')
-                if len(article_text) > 300:
-                    news_list.append({'source': 'NPR', 'title': title, 'description': article_text, 'link': link})
-
-            if len(news_list) >= limit: break
-
-    print(f"NPR: Зібрано {len(news_list)}")
-    return news_list
-
-
-def scrape_pbs(limit=50):
-    print(f"Скрапінг PBS NewsHour (Ціль: {limit} статей)...")
-    news_list = []
-    seen_links = set()
-    page = 1
-
-    while len(news_list) < limit and page <= 10:
-        url = f'https://www.pbs.org/newshour/latest/page/{page}'
-        html = fetch_html(url)
-        if not html: break
-
-        soup = BeautifulSoup(html, 'html.parser')
-
-        for a_tag in soup.find_all('a', href=True):
-            link = a_tag['href']
-
-            if '/newshour/' in link and len(link) > 40 and not link.endswith('/'):
-                title = a_tag.get_text(strip=True)
-
-                if len(title) > 20 and link not in seen_links:
-                    seen_links.add(link)
-                    if link.startswith('/'): link = 'https://www.pbs.org' + link
-
-                    article_text = get_article_text(link, 'PBS')
-                    if len(article_text) > 300:
-                        news_list.append({'source': 'PBS', 'title': title, 'description': article_text, 'link': link})
-
-            if len(news_list) >= limit: break
-        page += 1
-
-    print(f"PBS: Зібрано {len(news_list)}")
-    return news_list
-
-
-# --- 2. ОЧИЩЕННЯ ДАНИХ ---
-def clean_text(text):
-    if not isinstance(text, str): return ""
-    text = text.lower()
-    text = text.replace('-', '')
-    text = re.sub(r'[^a-z\s]', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-
-    custom_stops = {
-        'said', 'news', 'new', 'time', 'people', 'one', 'would', 'also', 'told', 'could', 'year', 'two', 'first',
-        'npr', 'pbs', 'guardian', 'caption', 'photo', 'image', 'images', 'getty', 'ap', 'reuters', 'press',
-        'associated', 'imageshide', 'hide', 'orb', 'episode', 'medication',
-        'nprhide', 'associate', 'january', 'february', 'march', 'april', 'may', 'june',
-        'july', 'august', 'september', 'october', 'november', 'december'
-    }
-
-    # Обробка тексту через spaCy
-    doc = nlp(text)
-    words = [
-        token.lemma_ for token in doc
-        if not token.is_stop and token.lemma_ not in custom_stops and len(token.lemma_) > 2
-    ]
-
-    return " ".join(words)
-
-
-# --- 3. ПОРІВНЯЛЬНИЙ АНАЛІЗ ТА NLP ---
-def analyze_and_visualize(df):
-    print("\n--- Початок аналізу даних ---")
-    df['full_text'] = df['description']
-    df['cleaned_text'] = df['full_text'].apply(clean_text)
-
-    vectorizer = TfidfVectorizer(
-        max_features=1000,
-        min_df=max(2, int(0.05 * len(df))),
-        max_df=0.85,
-        ngram_range=(1, 1)
-    )
-    X = vectorizer.fit_transform(df['cleaned_text'])
-
-    plt.figure(figsize=(15, 10))
-    sources = df['source'].unique()
-    top_words_per_source = {}
-
-    for i, source in enumerate(sources, 1):
-        source_idx = df.index[df['source'] == source].tolist()
-        source_X = X[source_idx]
-        sum_tfidf = source_X.sum(axis=0)
-
-        words_freq = [(word, sum_tfidf[0, idx]) for word, idx in vectorizer.vocabulary_.items()]
-        words_df = pd.DataFrame(words_freq, columns=['word', 'score'])
-        words_df = words_df.sort_values(by='score', ascending=False).head(15)
-        top_words_per_source[source] = words_df['word'].tolist()
-
-        plt.subplot(2, 2, i)
-        sns.barplot(x='score', y='word', data=words_df, hue='word', palette='viridis', legend=False)
-        plt.title(f'Топ-15 слів: {source}')
-        plt.xlabel('Вага TF-IDF')
-        plt.ylabel('')
+    for a in ax:
+        a.axis('off')
 
     plt.tight_layout()
-    plt.savefig('top_words.png')
-    print("Графік 'top_words.png' збережено.")
-    return top_words_per_source
+    plt.show()
 
+    return segmented_image
 
-# --- 4. АНАЛІЗ ТОНАЛЬНОСТІ ---
+def task3_counting(image_path):
+    print("--- Група 3: Гібридний підхід (Adaptive + Watershed) ---")
+    img = cv2.imread(image_path)
+    if img is None:
+        print("Помилка: Зображення не знайдено.")
+        return
 
-def sentiment_analysis(df):
-    sid = SentimentIntensityAnalyzer()
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_copy = img_rgb.copy()
 
-    def get_average_sentiment(text):
-        if not isinstance(text, str) or not text.strip():
-            return 0.0
+    # 1. Попередня обробка
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
 
-        sentences = nltk.sent_tokenize(text)
-        if not sentences:
-            return 0.0
+    # 2. Адаптивна бінаризація
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY_INV, 21, 4)
 
-        sentence_scores = [sid.polarity_scores(sentence)['compound'] for sentence in sentences]
-        return np.mean(sentence_scores)
+    # 3. Морфологічне очищення
+    kernel = np.ones((5, 5), np.uint8)
+    opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+    closing = cv2.morphologyEx(opening, cv2.MORPH_CLOSE, kernel, iterations=2)
+    sure_bg = cv2.dilate(closing, kernel, iterations=2)
 
-    df['compound'] = df['full_text'].apply(get_average_sentiment)
+    # 4. Центри об'єктів (Distance Transform)
+    dist_transform = cv2.distanceTransform(closing, cv2.DIST_L2, 5)
+    ret, sure_fg = cv2.threshold(dist_transform, 0.3 * dist_transform.max(), 255, 0)
+    sure_fg = np.uint8(sure_fg)
 
-    def categorize_sentiment(score):
-        if score >= 0.05:
-            return 'Positive'
-        elif score <= -0.05:
-            return 'Negative'
-        else:
-            return 'Neutral'
+    # 5. Підготовка до Watershed
+    unknown = cv2.subtract(sure_bg, sure_fg)
 
-    df['sentiment_type'] = df['compound'].apply(categorize_sentiment)
+    ret, markers = cv2.connectedComponents(sure_fg)
+    markers = markers + 1
+    markers[unknown == 255] = 0
+    markers = cv2.watershed(img, markers)
+    count = 0
+    min_area = 90
 
-    stats = df.groupby('source').agg(
-        avg_sentiment=('compound', 'mean'),
-        total=('compound', 'count')
-    )
+    for marker_id in np.unique(markers):
+        if marker_id <= 1:
+            continue
 
-    sent_counts = df.groupby(['source', 'sentiment_type']).size().unstack(fill_value=0)
-    for col in ['Positive', 'Negative', 'Neutral']:
-        if col not in sent_counts: sent_counts[col] = 0
+        mask = np.zeros(gray.shape, dtype="uint8")
+        mask[markers == marker_id] = 255
 
-    stats['pos_percent'] = (sent_counts['Positive'] / stats['total']) * 100
-    stats['neg_percent'] = (sent_counts['Negative'] / stats['total']) * 100
-    stats['neu_percent'] = (sent_counts['Neutral'] / stats['total']) * 100
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    return stats
+        if len(contours) > 0:
+            cnt = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(cnt) > min_area:
+                x, y, w, h = cv2.boundingRect(cnt)
+                cv2.rectangle(img_copy, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                count += 1
 
-def generate_conclusion(top_words, sentiment_stats):
-    print("\n1. Домінуючі теми (Ключові слова з відсіюванням аномалій):")
-    for source, words in top_words.items():
-        print(f"   - {source}: {', '.join(words[:7])}")
+    print(f"Знайдено об'єктів: {count}")
 
-    print("\n2. Аналіз тональності:")
-    for source, row in sentiment_stats.iterrows():
-        print(f"   - {source}: Середня тональність {row['avg_sentiment']:.3f}. "
-              f"(Поз: {row['pos_percent']:.1f}%, Нег: {row['neg_percent']:.1f}%, Нейтр: {row['neu_percent']:.1f}%)")
+    # Візуалізація
+    fig, ax = plt.subplots(1, 3, figsize=(18, 6))
 
-    print("\n3. Порівняння:")
-    most_neg = sentiment_stats['neg_percent'].idxmax()
-    most_pos = sentiment_stats['pos_percent'].idxmax()
+    ax[0].imshow(img_rgb)
+    ax[0].set_title("Оригінал")
 
-    print(f"   - Найвища концентрація негативу: {most_neg}.")
-    print(f"   - Найвища концентрація позитиву/оптимізму: {most_pos}.")
-    most_balanced = sentiment_stats['avg_sentiment'].abs().idxmin()
+    ax[1].imshow(dist_transform, cmap='jet')
+    ax[1].set_title("Карта відстаней (Distance Transform)")
 
-    print(f"   - Найбільш нейтральне/збалансоване джерело (за середнім показником): {most_balanced}.")
-    print("=" * 60 + "\n")
+    ax[2].imshow(img_copy)
+    ax[2].set_title(f"Результат: {count} об'єктів")
 
+    for a in ax: a.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+def task4_comparison(img1_path, img2_path):
+    print("---  Група 4: Порівняння ---")
+    img1 = cv2.imread(img1_path)
+    img2 = cv2.imread(img2_path)
+    if img1 is None or img2 is None:
+        print("Помилка: не знайдено одне з зображень для порівняння.")
+        return
+
+    img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+
+    gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+
+    orb = cv2.ORB_create(5000)
+    keypoints1, descriptors1 = orb.detectAndCompute(gray1, None)
+    keypoints2, descriptors2 = orb.detectAndCompute(gray2, None)
+
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = matcher.match(descriptors1, descriptors2)
+    matches = sorted(matches, key=lambda x: x.distance)
+
+    good_matches = matches[:int(len(matches) * 0.15)]
+
+    if len(good_matches) > 10:
+        src_pts = np.float32([keypoints2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([keypoints1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        img2_aligned = cv2.warpPerspective(img2, M, (img1.shape[1], img1.shape[0]))
+        gray2_aligned = cv2.cvtColor(img2_aligned, cv2.COLOR_BGR2GRAY)
+
+        valid_mask = np.ones_like(gray2) * 255
+        warped_mask = cv2.warpPerspective(valid_mask, M, (img1.shape[1], img1.shape[0]))
+    else:
+        print("Попередження: Не знайдено достатньо точок для вирівнювання.")
+        img2_aligned = img2
+        gray2_aligned = gray2
+        warped_mask = np.ones_like(gray2) * 255
+
+    (score, diff) = ssim(gray1, gray2_aligned, full=True)
+    diff = (diff * 255).astype("uint8")
+
+    _, thresh = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    mask_erosion_kernel = np.ones((5, 5), np.uint8)
+    warped_mask = cv2.erode(warped_mask, mask_erosion_kernel, iterations=2)
+    thresh = cv2.bitwise_and(thresh, thresh, mask=warped_mask)
+
+    kernel = np.ones((5, 5), np.uint8)
+    cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+    dilated = cv2.dilate(cleaned, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    img1_rgb = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)
+    img2_aligned_rgb = cv2.cvtColor(img2_aligned, cv2.COLOR_BGR2RGB)
+    result_img = img2_aligned_rgb.copy()
+
+    for cnt in contours:
+        if cv2.contourArea(cnt) > 200:
+            x, y, w, h = cv2.boundingRect(cnt)
+            cv2.rectangle(result_img, (x, y), (x + w, y + h), (255, 0, 0), 2)
+
+    fig, ax = plt.subplots(2, 2, figsize=(12, 10))
+    ax[0, 0].imshow(img1_rgb)
+    ax[0, 0].set_title("Зображення 1 (База)")
+    ax[0, 1].imshow(img2_aligned_rgb)
+    ax[0, 1].set_title("Зображення 2 (Вирівняне)")
+
+    ax[1, 0].imshow(diff, cmap='gray')
+    ax[1, 0].set_title("Мапа різниці (SSIM)")
+
+    ax[1, 1].imshow(result_img)
+    ax[1, 1].set_title("Знайдені відмінності")
+
+    for a in ax.flat:
+        a.axis('off')
+
+    plt.suptitle("Група 4: Порівняння зображень (з маскуванням країв)")
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == "__main__":
-    setup_nlp()
-    LIMIT = 50
-    data_guardian = scrape_guardian(LIMIT)
-    data_npr = scrape_npr(LIMIT)
-    data_pbs = scrape_pbs(LIMIT)
-    all_news = data_guardian + data_npr + data_pbs
-    df_all = pd.DataFrame(all_news)
-    counts = df_all['source'].value_counts()
-    print("\nРозподіл зібраних статей за джерелами:")
-    print(counts)
-    min_count = counts.min()
-    df_all = df_all.groupby('source').sample(min_count, random_state=42).reset_index(drop=True)
-    if counts.min() < 20:
-        print("\nНедостатньо даних для коректного порівняльного аналізу.")
-        print("Потрібно мінімум 20 статей на джерело.")
-        exit()
+    img_for_cluster = "img_4.png"
+    img_for_count = "img_1.png"
+    img_to_compare_1 = "img_2.png"
+    img_to_compare_2 = "img_3.png"
 
-    print(f"\nВибірка збалансована до {min_count} статей на джерело.")
-
-    if df_all.empty or len(counts) < 3:
-        print("Не вдалося зібрати достатньо даних з усіх джерел. Перевірте з'єднання або HTML-структуру.")
-    else:
-        df_all.to_csv('all_news_merged.csv', index=False)
-        print("Дані успішно збережено у CSV.")
-
-        top_words = analyze_and_visualize(df_all)
-        sentiment_stats = sentiment_analysis(df_all)
-        generate_conclusion(top_words, sentiment_stats)
+    task2_clustering_improved(img_for_cluster, k=10)
+    task3_counting(img_for_count)
+    task4_comparison(img_to_compare_1, img_to_compare_2)
